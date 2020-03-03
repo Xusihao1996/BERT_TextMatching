@@ -26,8 +26,12 @@ import optimization
 import tokenization
 import tensorflow as tf
 import pandas as pd
+import numpy as np
 
-flags = tf.compat.v1.flags
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+flags = tf.flags
+
 
 FLAGS = flags.FLAGS
 
@@ -100,25 +104,25 @@ flags.DEFINE_integer("iterations_per_loop", 1000,
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
-tf.compat.v1.flags.DEFINE_string(
+tf.flags.DEFINE_string(
     "tpu_name", None,
     "The Cloud TPU to use for training. This should be either the name "
     "used when creating the Cloud TPU, or a grpc://ip.address.of.tpu:8470 "
     "url.")
 
-tf.compat.v1.flags.DEFINE_string(
+tf.flags.DEFINE_string(
     "tpu_zone", None,
     "[Optional] GCE zone where the Cloud TPU is located in. If not "
     "specified, we will attempt to automatically detect the GCE project from "
     "metadata.")
 
-tf.compat.v1.flags.DEFINE_string(
+tf.flags.DEFINE_string(
     "gcp_project", None,
     "[Optional] Project name for the Cloud TPU-enabled project. If not "
     "specified, we will attempt to automatically detect the GCE project from "
     "metadata.")
 
-tf.compat.v1.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
+tf.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
 
 flags.DEFINE_integer(
     "num_tpu_cores", 8,
@@ -520,6 +524,7 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
     tokens.append("[SEP]")
     segment_ids.append(1)
 
+  new_token = list(tokens)
   input_ids = tokenizer.convert_tokens_to_ids(tokens)
 
   # The mask has 1 for real tokens and 0 for padding tokens. Only real
@@ -528,13 +533,32 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
 
   # Zero-pad up to the sequence length.
   while len(input_ids) < max_seq_length:
+    new_token.append(0)
     input_ids.append(0)
     input_mask.append(0)
     segment_ids.append(0)
 
+
   assert len(input_ids) == max_seq_length
   assert len(input_mask) == max_seq_length
   assert len(segment_ids) == max_seq_length
+
+  def create_mask(values):
+      left_once = list(values)
+      left_twice = list(values)
+      for i in range(1):
+          left_once.insert(len(left_once), left_once[0])
+          left_once.remove(left_once[0])
+      for i in range(2):
+          left_twice.insert(len(left_twice), left_twice[0])
+          left_twice.remove(left_twice[0])
+      bigram = list(zip(values, left_once))
+      trigram = list(zip(values, left_once, left_twice))
+      output = values + bigram + trigram
+
+
+
+  mask = create_mask(new_token)
 
   label_id = label_map[example.label]
   if ex_index < 5:
@@ -763,7 +787,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
           scaffold_fn=scaffold_fn)
     elif mode == tf.estimator.ModeKeys.EVAL:
 
-      def metric_fn(per_example_loss, label_ids, logits, is_real_example, attention_output):
+      def metric_fn(per_example_loss, label_ids, logits, is_real_example):
         predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
         accuracy = tf.metrics.accuracy(
             labels=label_ids, predictions=predictions, weights=is_real_example)
@@ -771,11 +795,10 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
         return {
             "eval_accuracy": accuracy,
             "eval_loss": loss,
-            "attention_output": attention_output,
         }
 
       eval_metrics = (metric_fn,
-                      [per_example_loss, label_ids, logits, is_real_example, attention_output])
+                      [per_example_loss, label_ids, logits, is_real_example])
       output_spec = tf.contrib.tpu.TPUEstimatorSpec(
           mode=mode,
           loss=total_loss,
@@ -784,7 +807,8 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
     else:
       output_spec = tf.contrib.tpu.TPUEstimatorSpec(
           mode=mode,
-          predictions={"probabilities": probabilities},
+          predictions={"probabilities": probabilities,
+                       "attention": attention_output},
           scaffold_fn=scaffold_fn)
     return output_spec
 
@@ -863,7 +887,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
 
 
 def main(_):
-  tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
+  tf.logging.set_verbosity(tf.logging.INFO)
 
   processors = {
       "cola": ColaProcessor,
@@ -888,7 +912,7 @@ def main(_):
         "was only trained up to sequence length %d" %
         (FLAGS.max_seq_length, bert_config.max_position_embeddings))
 
-  tf.compat.v1.gfile.MakeDirs(FLAGS.output_dir)
+  tf.gfile.MakeDirs(FLAGS.output_dir)
 
   task_name = FLAGS.task_name.lower()
 
@@ -904,7 +928,7 @@ def main(_):
 
   tpu_cluster_resolver = None
   if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
+    tpu_cluster_resolver = tf.contrib.tpu.cluster_resolver.TPUClusterResolver(
         FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
 
   is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
@@ -1040,19 +1064,37 @@ def main(_):
     result = estimator.predict(input_fn=predict_input_fn)
 
     output_predict_file = os.path.join(FLAGS.output_dir, "test_results.tsv")
-    with tf.gfile.GFile(output_predict_file, "w") as writer:
-      num_written_lines = 0
-      tf.logging.info("***** Predict results *****")
-      for (i, prediction) in enumerate(result):
-        probabilities = prediction["probabilities"]
-        if i >= num_actual_predict_examples:
+    output_attention_file = os.path.join(FLAGS.output_dir, "attention_results_3.tsv")
+    #with tf.gfile.GFile(output_predict_file, "w") as writer:
+      #num_written_lines = 0
+      #tf.logging.info("***** Predict results *****")
+      #for (i, prediction) in enumerate(result):
+        #probabilities = prediction["probabilities"]
+        #if i >= num_actual_predict_examples:
+          #break
+        #output_line = "\t".join(
+            #str(class_probability)
+            #for class_probability in probabilities) + "\n"
+        #writer.write(output_line)
+        #num_written_lines += 1
+    #assert num_written_lines == num_actual_predict_examples
+    with tf.gfile.GFile(output_attention_file, "w") as writer:
+      num_written_lines_for_attention = 0
+      tf.logging.info("***** Attention results *****")
+      for(j, prediction) in enumerate(result):
+        attention_output = prediction["attention"]
+        attention_output_11 = attention_output[-1:, :, ]
+        np.set_printoptions(threshold=1000000)
+        np.save("attention_g.npy", attention_output_11)
+        if j >= 0:
           break
-        output_line = "\t".join(
-            str(class_probability)
-            for class_probability in probabilities) + "\n"
-        writer.write(output_line)
-        num_written_lines += 1
-    assert num_written_lines == num_actual_predict_examples
+        attention_output_line = "\t".join(
+            str(class_attention)
+            for class_attention in attention_output_11) + "\n"
+        writer.write(attention_output_line)
+        num_written_lines_for_attention += 1
+    assert num_written_lines_for_attention == 0
+
 
 
 if __name__ == "__main__":
@@ -1061,4 +1103,4 @@ if __name__ == "__main__":
   flags.mark_flag_as_required("vocab_file")
   flags.mark_flag_as_required("bert_config_file")
   flags.mark_flag_as_required("output_dir")
-  tf.compat.v1.app.run()
+  tf.app.run()
