@@ -131,6 +131,7 @@ class BertModel(object):
                config,
                is_training,
                input_ids,
+               mask=None,
                input_mask=None,
                token_type_ids=None,
                use_one_hot_embeddings=True,
@@ -166,6 +167,9 @@ class BertModel(object):
     if input_mask is None:
       input_mask = tf.ones(shape=[batch_size, seq_length], dtype=tf.int32)
 
+    if mask is None:
+      mask = tf.ones(shape=[batch_size, seq_length], dtype=tf.int32)
+
     if token_type_ids is None:
       token_type_ids = tf.zeros(shape=[batch_size, seq_length], dtype=tf.int32)
 
@@ -199,7 +203,7 @@ class BertModel(object):
         # mask of shape [batch_size, seq_length, seq_length] which is used
         # for the attention scores.
         attention_mask = create_attention_mask_from_input_mask(
-            input_ids, input_mask)
+            input_ids, input_mask, mask)
 
         # Run the stacked transformer.
         # `sequence_output` shape = [batch_size, seq_length, hidden_size].
@@ -532,7 +536,7 @@ def embedding_postprocessor(input_tensor,
   return output
 
 
-def create_attention_mask_from_input_mask(from_tensor, to_mask):
+def create_attention_mask_from_input_mask(from_tensor, to_mask, one_mask):
   """Create 3D attention mask from a 2D tensor mask.
 
   Args:
@@ -549,9 +553,17 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
   to_shape = get_shape_list(to_mask, expected_rank=2)
   to_seq_length = to_shape[1]
 
+  one_mask_shape = get_shape_list(one_mask, expected_rank=2)
+  one_mask_length = one_mask_shape[1]
+
   to_mask = tf.cast(
       tf.reshape(to_mask, [batch_size, 1, to_seq_length]), tf.float32)
   to_mask = tf.tile(to_mask, (1, 1, 3))
+
+  one_mask = tf.cast(
+      tf.reshape(one_mask, [batch_size, 1, one_mask_length]), tf.float32)
+
+  to_mask = to_mask * one_mask
 
   # We don't assume that `from_tensor` is a mask (although it could be). We
   # don't actually care if we attend *from* padding tokens (only *to* padding)
@@ -901,10 +913,10 @@ def transformer_model(input_tensor,
     for layer_output in all_layer_outputs:
       final_output = reshape_from_matrix(layer_output, input_shape)
       final_outputs.append(final_output)
-    return (final_outputs, attention_probability)
+    return final_outputs, attention_probability
   else:
     final_output = reshape_from_matrix(prev_output, input_shape)
-    return (final_output, attention_probability)
+    return final_output, attention_probability
 
 
 def get_shape_list(tensor, expected_rank=None, name=None):

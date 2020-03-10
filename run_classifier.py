@@ -171,11 +171,13 @@ class InputFeatures(object):
                input_mask,
                segment_ids,
                label_id,
+               mask,
                is_real_example=True):
     self.input_ids = input_ids
     self.input_mask = input_mask
     self.segment_ids = segment_ids
     self.label_id = label_id
+    self.mask = mask
     self.is_real_example = is_real_example
 
 
@@ -335,6 +337,52 @@ class SimProcessor(DataProcessor):
   def get_labels(self):
     return ['0', '1']
 
+  def get_train_participle(self, data_dir):
+    file_path = os.path.join(data_dir, 'train_divided.txt')
+    f = open(file_path, 'r')
+    train_divided_data = []
+    index = 0
+    for line in f.readlines():
+        guid = 'train_divided-%d' % index
+        line = line.replace("\n", "")
+        line = line.replace(" \t", "")
+        line = line.split(" ")
+        line.pop(-1)
+        train_divided_data.append(line)
+        index += 1
+    return train_divided_data
+
+  def get_eval_participle(self, data_dir):
+    file_path = os.path.join(data_dir, 'dev_divided.txt')
+    f = open(file_path, 'r')
+    dev_divided_data = []
+    index = 0
+    for line in f.readlines():
+        guid = 'dev_divided-%d' % index
+        line = line.replace("\n", "")
+        line = line.replace(" \t", "")
+        line = line.split(" ")
+        line.pop(-1)
+        dev_divided_data.append(line)
+        index += 1
+    return dev_divided_data
+
+  def get_test_participle(self, data_dir):
+    file_path = os.path.join(data_dir, 'test_divided.txt')
+    f = open(file_path, 'r')
+    test_divided_data = []
+    index = 0
+    for line in f.readlines():
+        guid = 'dev_divided-%d' % index
+        line = line.replace("\n", "")
+        line = line.replace(" \t", "")
+        line = line.split(" ")
+        line.pop(-1)
+        test_divided_data.append(line)
+        index += 1
+    return test_divided_data
+
+
 
 class MnliProcessor(DataProcessor):
   """Processor for the MultiNLI data set (GLUE version)."""
@@ -459,7 +507,7 @@ class ColaProcessor(DataProcessor):
 
 
 def convert_single_example(ex_index, example, label_list, max_seq_length,
-                           tokenizer):
+                           tokenizer, divided_examples):
   """Converts a single `InputExample` into a single `InputFeatures`."""
 
   if isinstance(example, PaddingInputExample):
@@ -468,6 +516,7 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
         input_mask=[0] * max_seq_length,
         segment_ids=[0] * max_seq_length,
         label_id=0,
+        mask=[0] * (max_seq_length * 3),
         is_real_example=False)
 
   label_map = {}
@@ -533,7 +582,7 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
 
   # Zero-pad up to the sequence length.
   while len(input_ids) < max_seq_length:
-    new_token.append(0)
+    new_token.append('0')
     input_ids.append(0)
     input_mask.append(0)
     segment_ids.append(0)
@@ -543,7 +592,7 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
   assert len(input_mask) == max_seq_length
   assert len(segment_ids) == max_seq_length
 
-  def create_mask(values):
+  def create_uni_bi_tri(values):
       left_once = list(values)
       left_twice = list(values)
       for i in range(1):
@@ -552,13 +601,21 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
       for i in range(2):
           left_twice.insert(len(left_twice), left_twice[0])
           left_twice.remove(left_twice[0])
-      bigram = list(zip(values, left_once))
-      trigram = list(zip(values, left_once, left_twice))
+      bigram = []
+      trigram = []
+      for i in range(0, len(values)):
+          bigram.append(values[i]+left_once[i])
+          trigram.append(values[i]+left_once[i]+left_twice[i])
       output = values + bigram + trigram
+      return output
 
-
-
-  mask = create_mask(new_token)
+  matrix = create_uni_bi_tri(new_token)
+  mask = [0] * (max_seq_length * 3)
+  t = divided_examples[ex_index]
+  for i, x in enumerate(matrix):
+      for j in t:
+          if x == j:
+              mask[i] = 1
 
   label_id = label_map[example.label]
   if ex_index < 5:
@@ -576,12 +633,13 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
       input_mask=input_mask,
       segment_ids=segment_ids,
       label_id=label_id,
+      mask=mask,
       is_real_example=True)
   return feature
 
 
 def file_based_convert_examples_to_features(
-    examples, label_list, max_seq_length, tokenizer, output_file):
+    examples, label_list, max_seq_length, tokenizer, output_file, divided_examples):
   """Convert a set of `InputExample`s to a TFRecord file."""
 
   writer = tf.python_io.TFRecordWriter(output_file)
@@ -591,7 +649,7 @@ def file_based_convert_examples_to_features(
       tf.logging.info("Writing example %d of %d" % (ex_index, len(examples)))
 
     feature = convert_single_example(ex_index, example, label_list,
-                                     max_seq_length, tokenizer)
+                                     max_seq_length, tokenizer, divided_examples)
 
     def create_int_feature(values):
       f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
@@ -602,6 +660,7 @@ def file_based_convert_examples_to_features(
     features["input_mask"] = create_int_feature(feature.input_mask)
     features["segment_ids"] = create_int_feature(feature.segment_ids)
     features["label_ids"] = create_int_feature([feature.label_id])
+    features["mask"] = create_int_feature(feature.mask)
     features["is_real_example"] = create_int_feature(
         [int(feature.is_real_example)])
 
@@ -619,6 +678,7 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
       "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
       "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
       "label_ids": tf.FixedLenFeature([], tf.int64),
+      "mask": tf.FixedLenFeature([seq_length*3], tf.int64),
       "is_real_example": tf.FixedLenFeature([], tf.int64),
   }
 
@@ -675,7 +735,7 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
       tokens_b.pop()
 
 
-def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
+def create_model(bert_config, is_training, input_ids, input_mask, mask, segment_ids,
                  labels, num_labels, use_one_hot_embeddings):
   """Creates a classification model."""
   model = modeling.BertModel(
@@ -683,6 +743,7 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
       is_training=is_training,
       input_ids=input_ids,
       input_mask=input_mask,
+      mask=mask,
       token_type_ids=segment_ids,
       use_one_hot_embeddings=use_one_hot_embeddings)
 
@@ -737,6 +798,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
     input_ids = features["input_ids"]
     input_mask = features["input_mask"]
     segment_ids = features["segment_ids"]
+    mask = features["mask"]
     label_ids = features["label_ids"]
     is_real_example = None
     if "is_real_example" in features:
@@ -747,7 +809,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
     is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
     (attention_output, total_loss, per_example_loss, logits, probabilities) = create_model(
-        bert_config, is_training, input_ids, input_mask, segment_ids, label_ids,
+        bert_config, is_training, input_ids, input_mask, mask, segment_ids, label_ids,
         num_labels, use_one_hot_embeddings)
 
     tvars = tf.trainable_variables()
@@ -943,10 +1005,12 @@ def main(_):
           per_host_input_for_training=is_per_host))
 
   train_examples = None
+  train_divided_examples = None
   num_train_steps = None
   num_warmup_steps = None
   if FLAGS.do_train:
     train_examples = processor.get_train_examples(FLAGS.data_dir)
+    train_divided_examples = processor.get_train_participle(FLAGS.data_dir)
     num_train_steps = int(
         len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
     num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
@@ -974,7 +1038,7 @@ def main(_):
   if FLAGS.do_train:
     train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
     file_based_convert_examples_to_features(
-        train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file)
+        train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file, train_divided_examples)
     tf.logging.info("***** Running training *****")
     tf.logging.info("  Num examples = %d", len(train_examples))
     tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
@@ -988,6 +1052,7 @@ def main(_):
 
   if FLAGS.do_eval:
     eval_examples = processor.get_dev_examples(FLAGS.data_dir)
+    eval_divided_examples = processor.get_eval_participle(FLAGS.data_dir)
     num_actual_eval_examples = len(eval_examples)
     if FLAGS.use_tpu:
       # TPU requires a fixed batch size for all batches, therefore the number
@@ -1000,7 +1065,7 @@ def main(_):
 
     eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
     file_based_convert_examples_to_features(
-        eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file)
+        eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file, eval_divided_examples)
 
     tf.logging.info("***** Running evaluation *****")
     tf.logging.info("  Num examples = %d (%d actual, %d padding)",
@@ -1034,6 +1099,7 @@ def main(_):
 
   if FLAGS.do_predict:
     predict_examples = processor.get_test_examples(FLAGS.data_dir)
+    predict_divided_examples = processor.get_test_participle(FLAGS.data_dir)
     num_actual_predict_examples = len(predict_examples)
     if FLAGS.use_tpu:
       # TPU requires a fixed batch size for all batches, therefore the number
@@ -1046,7 +1112,7 @@ def main(_):
     predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
     file_based_convert_examples_to_features(predict_examples, label_list,
                                             FLAGS.max_seq_length, tokenizer,
-                                            predict_file)
+                                            predict_file, predict_divided_examples)
 
     tf.logging.info("***** Running prediction*****")
     tf.logging.info("  Num examples = %d (%d actual, %d padding)",
@@ -1085,7 +1151,7 @@ def main(_):
         attention_output = prediction["attention"]
         attention_output_11 = attention_output[-1:, :, ]
         np.set_printoptions(threshold=1000000)
-        np.save("attention_g.npy", attention_output_11)
+        np.save("attention_h.npy", attention_output_11)
         if j >= 0:
           break
         attention_output_line = "\t".join(
